@@ -8,6 +8,13 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { port } from "./Server_utils/port.js";
 import PDFDocument from "pdfkit";
+import {
+  randomBytes,
+  randomInt,
+  createHmac,
+  timingSafeEqual,
+} from "node:crypto";
+import nodemailer from "nodemailer";
 
 const required = ["MONGODB_URI", "JWT_SECRET"];
 for (const name of required)
@@ -122,29 +129,37 @@ const Scenario = mongoose.model(
     { timestamps: true },
   ),
 );
+
+const SimulationSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RadioUser",
+      required: true,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ["running", "stopped"],
+      default: "running",
+    },
+    startedAt: Date,
+    stoppedAt: Date,
+    scenarioSnapshot: Object,
+    stableResults: Object,
+    environmentSnapshot: {
+      type: Object,
+      default: null,
+    },
+    seed: Number,
+  },
+  { timestamps: true },
+);
+
 const Simulation = mongoose.model(
   "ScannerSession",
-  new mongoose.Schema(
-    {
-      userId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "RadioUser",
-        required: true,
-        index: true,
-      },
-      status: {
-        type: String,
-        enum: ["running", "stopped"],
-        default: "running",
-      },
-      startedAt: Date,
-      stoppedAt: Date,
-      scenarioSnapshot: Object,
-      stableResults: Object,
-      seed: Number,
-    },
-    { timestamps: true },
-  ),
+  SimulationSchema,
+  "scannersessions",
 );
 const Audit = mongoose.model(
   "ScannerAudit",
@@ -155,6 +170,70 @@ const Audit = mongoose.model(
     createdAt: { type: Date, default: Date.now },
   }),
 );
+const OtpChallenge = mongoose.model(
+  "ScannerOtpChallenge",
+  new mongoose.Schema(
+    {
+      userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "RadioUser",
+        required: true,
+        index: true,
+      },
+      challengeHash: { type: String, required: true, unique: true },
+      otpHash: { type: String, required: true },
+      expiresAt: { type: Date, required: true, index: { expires: 0 } },
+      attempts: { type: Number, default: 0 },
+      resendAt: { type: Date, required: true },
+      consumed: { type: Boolean, default: false },
+    },
+    { timestamps: true },
+  ),
+);
+const otpHash = (value) =>
+  createHmac("sha256", process.env.JWT_SECRET).update(value).digest("hex");
+const otpToken = () => randomBytes(32).toString("hex");
+const signInToken = (user) =>
+  jwt.sign({ role: user.role }, process.env.JWT_SECRET, {
+    subject: String(user.id),
+    expiresIn: "8h",
+  });
+const otpTransport = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: Number(process.env.SMTP_PORT || 587) === 465,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+});
+async function issueOtp(user, existingChallenge) {
+  if (
+    !process.env.OTP_RECIPIENT_EMAIL ||
+    !process.env.SMTP_HOST ||
+    !process.env.SMTP_USER ||
+    !process.env.SMTP_PASSWORD ||
+    !process.env.SMTP_FROM
+  ) {
+    throw new Error("Email OTP SMTP configuration is incomplete");
+  }
+  const code = String(randomInt(100000, 1000000));
+  const challengeToken = otpToken();
+  const now = Date.now();
+  // Do not invalidate a working code until the new email is accepted.
+  await otpTransport.sendMail({
+    from: process.env.SMTP_FROM,
+    to: process.env.OTP_RECIPIENT_EMAIL,
+    subject: `Scanner login verification - ${user.username}`,
+    text: `Scanner login requested for ${user.username}.\n\nYour verification code is: ${code}\n\nIt expires in 5 minutes. If you did not request this login, ignore this email.`,
+  });
+  await OtpChallenge.deleteMany({ userId: user._id });
+  await OtpChallenge.create({
+    userId: user._id,
+    challengeHash: otpHash(challengeToken),
+    otpHash: otpHash(code),
+    expiresAt: new Date(now + 5 * 60 * 1000),
+    resendAt: new Date(now + 60 * 1000),
+  });
+  return challengeToken;
+}
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 const publicUser = (user) => ({
@@ -240,6 +319,68 @@ const stableFrom = (scenario) => ({
 });
 
 const weatherCache = new Map();
+
+function environmentFromWeather(result) {
+  return {
+    temperature: result.temperature,
+    pressure: result.pressure,
+    humidity: result.humidity,
+    windSpeed: result.windSpeed,
+    source: result.source,
+    location: result.location,
+    observedAt: result.observedAt,
+    timezone: result.timezone,
+  };
+}
+
+async function saveEnvironmentSnapshot(userId, result) {
+  if (!result) {
+    console.warn("[Weather] No weather result provided");
+    return null;
+  }
+
+  const snapshot = environmentFromWeather(result);
+
+  console.log("[Weather] Saving environment snapshot:", {
+    userId: String(userId),
+    temperature: snapshot.temperature,
+    pressure: snapshot.pressure,
+    collection: Simulation.collection.name,
+  });
+
+  const simulation = await Simulation.findOneAndUpdate(
+    {
+      userId: new mongoose.Types.ObjectId(String(userId)),
+      status: "running",
+    },
+    {
+      $set: {
+        environmentSnapshot: snapshot,
+      },
+    },
+    {
+      new: true,
+      sort: { startedAt: -1 },
+      runValidators: true,
+    },
+  );
+
+  if (!simulation) {
+    console.warn("[Weather] No running simulation found:", {
+      userId: String(userId),
+    });
+
+    return null;
+  }
+
+  console.log("[Weather] Environment snapshot persisted:", {
+    simulationId: String(simulation._id),
+    temperature: simulation.environmentSnapshot?.temperature,
+    pressure: simulation.environmentSnapshot?.pressure,
+  });
+
+  return simulation;
+}
 
 function liveSample(sim, at = Date.now()) {
   const elapsed = Math.max(
@@ -333,17 +474,92 @@ app.post(
       !(await bcrypt.compare(input.password, user.passwordHash))
     )
       return res.status(401).json({ message: "Invalid credentials" });
-    if (user.otpEnabled)
-      return res.status(409).json({
-        code: "OTP_NOT_CONFIGURED",
-        message:
-          "OTP delivery and verification must be configured before this account can sign in.",
+    if (user.role === "user" && user.otpEnabled) {
+      const recent = await OtpChallenge.findOne({
+        userId: user._id,
+        expiresAt: { $gt: new Date() },
       });
-    const token = jwt.sign({ role: user.role }, process.env.JWT_SECRET, {
-      subject: String(user.id),
-      expiresIn: "8h",
-    });
+      if (recent && recent.resendAt > new Date())
+        return res.status(429).json({
+          code: "OTP_COOLDOWN",
+          message: "Please wait before requesting another login code.",
+        });
+      const challengeToken = await issueOtp(user);
+      return res.json({ requiresOtp: true, challengeToken });
+    }
+    const token = signInToken(user);
     res.json({ token, user: publicUser(user) });
+  }),
+);
+app.post(
+  "/api/auth/resend-otp",
+  wrap(async (req, res) => {
+    const { challengeToken } = z
+      .object({ challengeToken: z.string().min(32) })
+      .parse(req.body);
+    const record = await OtpChallenge.findOne({
+      challengeHash: otpHash(challengeToken),
+      consumed: false,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!record)
+      return res
+        .status(401)
+        .json({ message: "OTP challenge expired. Sign in again." });
+    if (record.resendAt > new Date())
+      return res
+        .status(429)
+        .json({ message: "Please wait 60 seconds before resending." });
+    if (record.attempts >= 5)
+      return res
+        .status(429)
+        .json({ message: "Too many attempts. Sign in again." });
+    const user = await User.findById(record.userId);
+    if (!user || !user.active || user.role !== "user" || !user.otpEnabled)
+      return res.status(403).json({ message: "OTP unavailable" });
+    const nextChallengeToken = await issueOtp(user, record);
+    res.json({ requiresOtp: true, challengeToken: nextChallengeToken });
+  }),
+);
+app.post(
+  "/api/auth/verify-otp",
+  wrap(async (req, res) => {
+    const { challengeToken, otp } = z
+      .object({
+        challengeToken: z.string().min(32),
+        otp: z.string().regex(/^\d{6}$/),
+      })
+      .parse(req.body);
+    // Atomically consume an attempt before checking the code.
+    const record = await OtpChallenge.findOneAndUpdate(
+      {
+        challengeHash: otpHash(challengeToken),
+        consumed: false,
+        expiresAt: { $gt: new Date() },
+        attempts: { $lt: 5 },
+      },
+      { $inc: { attempts: 1 } },
+      { new: true },
+    );
+    if (!record)
+      return res
+        .status(401)
+        .json({ message: "Invalid, expired, or exhausted OTP challenge" });
+    const expected = Buffer.from(record.otpHash, "hex");
+    const received = Buffer.from(otpHash(otp), "hex");
+    if (!timingSafeEqual(expected, received))
+      return res.status(401).json({ message: "Invalid OTP" });
+    const consumed = await OtpChallenge.findOneAndUpdate(
+      { _id: record._id, consumed: false },
+      { $set: { consumed: true } },
+      { new: true },
+    );
+    if (!consumed) return res.status(401).json({ message: "OTP already used" });
+    const user = await User.findById(record.userId);
+    if (!user || !user.active || user.role !== "user" || !user.otpEnabled)
+      return res.status(403).json({ message: "Account unavailable" });
+    await OtpChallenge.deleteMany({ userId: user._id });
+    res.json({ token: signInToken(user), user: publicUser(user) });
   }),
 );
 app.post(
@@ -499,22 +715,53 @@ app.post(
   "/api/simulations/start",
   auth,
   wrap(async (req, res) => {
-    if (req.user.role !== "user")
+    if (req.user.role !== "user") {
       return res.status(403).json({ message: "User only" });
+    }
+
     let sim = await latest(req.user.id);
+
     if (!sim) {
-      const s = await Scenario.findOne({ userId: req.user.id, enabled: true });
-      if (!s) return res.status(404).json({ message: "No scenario assigned" });
+      const s = await Scenario.findOne({
+        userId: req.user.id,
+        enabled: true,
+      });
+
+      if (!s) {
+        return res.status(404).json({ message: "No scenario assigned" });
+      }
+
       const snapshot = s.toObject();
+      const cachedWeather = weatherCache.get(
+        String(snapshot.location ?? "").trim(),
+      );
+
+      const validCachedWeather =
+        cachedWeather && cachedWeather.expiresAt > Date.now()
+          ? cachedWeather.data
+          : null;
       sim = await Simulation.create({
         userId: req.user.id,
         status: "running",
         startedAt: new Date(),
         scenarioSnapshot: snapshot,
         stableResults: stableFrom(snapshot),
+        environmentSnapshot: validCachedWeather
+          ? environmentFromWeather(validCachedWeather)
+          : null,
         seed: Math.floor(Math.random() * 100000),
       });
+    } else if (!sim.environmentSnapshot) {
+      const location = String(sim.scenarioSnapshot?.location ?? "").trim();
+
+      const cachedWeather = weatherCache.get(location);
+
+      if (cachedWeather && cachedWeather.expiresAt > Date.now()) {
+        sim.environmentSnapshot = environmentFromWeather(cachedWeather.data);
+        await sim.save();
+      }
     }
+
     res.json({
       id: String(sim.id),
       status: sim.status,
@@ -523,7 +770,6 @@ app.post(
     });
   }),
 );
-
 app.get(
   "/api/simulations/active",
   auth,
@@ -537,6 +783,12 @@ app.get(
     const scenario = sim.scenarioSnapshot;
     const values = liveSample(sim);
     const depleted = await stopIfBatteryDepleted(sim, values);
+    if (sim.environmentSnapshot) {
+      values.temperature =
+        sim.environmentSnapshot.temperature ?? values.temperature;
+
+      values.pressure = sim.environmentSnapshot.pressure ?? values.pressure;
+    }
     return res.json({
       id: String(sim.id),
       status: depleted ? "stopped" : sim.status,
@@ -572,27 +824,50 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const sim = await latest(req.user.id);
-    if (!sim)
-      return res.status(404).json({ message: "Start simulation first" });
-    const s = sim.scenarioSnapshot;
+
+    if (!sim) {
+      return res.status(404).json({
+        message: "Start simulation first",
+      });
+    }
+
+    const s = sim.scenarioSnapshot || {};
+    const environment = sim.environmentSnapshot || {};
     res.json({
       simulationId: String(sim.id),
       scenarioType: s.scenarioType,
       scenarioName: s.scenarioName,
-      results: sim.stableResults,
-      units: Object.fromEntries(
-        ["cps", "doseRate", "battery", "temperature", "pressure"].map((k) => [
-          k,
-          s[k].unit,
-        ]),
-      ),
+
+      results: {
+        ...sim.stableResults,
+
+        // Use actual weather readings when available.
+        temperature: environment.temperature ?? sim.stableResults.temperature,
+
+        pressure: environment.pressure ?? sim.stableResults.pressure,
+      },
+
+      units: {
+        cps: s.cps?.unit ?? "CPS",
+        doseRate: s.doseRate?.unit ?? "µSv/h",
+        battery: s.battery?.unit ?? "%",
+        temperature:
+          environment.temperature != null
+            ? "°C"
+            : (s.temperature?.unit ?? "°C"),
+        pressure:
+          environment.pressure != null ? "hPa" : (s.pressure?.unit ?? "hPa"),
+      },
+
       isotopes: s.isotopes || [],
       impression: normalizeImpressions(s.impression),
       location: s.location,
       startedAt: sim.startedAt,
+      environmentSnapshot: sim.environmentSnapshot ?? null,
     });
   }),
 );
+
 app.get(
   "/api/admin/audit",
   auth,
@@ -824,17 +1099,6 @@ app.get(
   }),
 );
 
-app.use((err, req, res, next) => {
-  if (err instanceof z.ZodError)
-    return res
-      .status(400)
-      .json({ message: "Invalid input", issues: err.issues });
-  if (err?.code === 11000)
-    return res.status(409).json({ message: "Already exists" });
-  console.error(err);
-  res.status(500).json({ message: "Internal server error" });
-});
-
 app.get(
   "/api/weather/current",
   auth,
@@ -850,7 +1114,6 @@ app.get(
       });
     }
 
-    // Adapt if your location field is an object.
     const location = String(scenario.location ?? "").trim();
 
     if (!location || location === "[object Object]") {
@@ -859,12 +1122,15 @@ app.get(
       });
     }
 
+    // Check cached weather first.
     const cached = weatherCache.get(location);
+
     if (cached && cached.expiresAt > Date.now()) {
+      await saveEnvironmentSnapshot(req.user.id, cached.data);
       return res.json(cached.data);
     }
 
-    // 1. Resolve location into coordinates.
+    // Resolve configured location.
     const geoUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
 
     geoUrl.searchParams.set("name", location);
@@ -887,11 +1153,12 @@ app.get(
       });
     }
 
-    // 2. Fetch current weather.
+    // Fetch current weather.
     const weatherUrl = new URL("https://api.open-meteo.com/v1/forecast");
 
     weatherUrl.searchParams.set("latitude", String(place.latitude));
     weatherUrl.searchParams.set("longitude", String(place.longitude));
+
     weatherUrl.searchParams.set(
       "current",
       [
@@ -902,6 +1169,7 @@ app.get(
         "weather_code",
       ].join(","),
     );
+
     weatherUrl.searchParams.set("timezone", "auto");
 
     const weatherResponse = await fetch(weatherUrl, {
@@ -919,8 +1187,10 @@ app.get(
     }
 
     const result = {
+      success: true,
       source: "Open-Meteo",
-      location: [place.name, place.admin1, place.country]
+      location,
+      resolvedLocation: [place.name, place.admin1, place.country]
         .filter(Boolean)
         .join(", "),
       temperature: weather.current.temperature_2m,
@@ -932,34 +1202,84 @@ app.get(
       timezone: weather.timezone,
     };
 
+    // Cache weather for five minutes.
     weatherCache.set(location, {
       data: result,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
 
-    res.json(result);
+    // Save weather against the latest running simulation.
+    await saveEnvironmentSnapshot(req.user.id, result);
+
+    return res.json(result);
   }),
 );
 
-await mongoose.connect(process.env.MONGODB_URI);
-if (
-  process.env.BOOTSTRAP_ADMIN_USERNAME &&
-  process.env.BOOTSTRAP_ADMIN_PASSWORD
-) {
-  if (process.env.BOOTSTRAP_ADMIN_PASSWORD.length < 8)
-    throw new Error("Bootstrap admin password is too short");
-  if (
-    !(await User.exists({ username: process.env.BOOTSTRAP_ADMIN_USERNAME }))
-  ) {
-    await User.create({
-      username: process.env.BOOTSTRAP_ADMIN_USERNAME,
-      passwordHash: await bcrypt.hash(process.env.BOOTSTRAP_ADMIN_PASSWORD, 12),
-      name: "Administrator",
-      role: "admin",
-    });
-    console.log("Bootstrap admin account created");
+// Keep the error handler AFTER all API routes.
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
   }
+
+  if (err instanceof z.ZodError) {
+    return res.status(400).json({
+      message: "Invalid input",
+      issues: err.issues,
+    });
+  }
+
+  if (err?.code === 11000) {
+    return res.status(409).json({
+      message: "Already exists",
+    });
+  }
+
+  console.error("API error:", err);
+
+  res.status(500).json({
+    message: "Internal server error",
+  });
+});
+
+// Connect to MongoDB before starting the server.
+async function startServer() {
+  await mongoose.connect(process.env.MONGODB_URI);
+
+  console.log("MongoDB connected");
+
+  if (
+    process.env.BOOTSTRAP_ADMIN_USERNAME &&
+    process.env.BOOTSTRAP_ADMIN_PASSWORD
+  ) {
+    if (process.env.BOOTSTRAP_ADMIN_PASSWORD.length < 8) {
+      throw new Error("Bootstrap admin password is too short");
+    }
+
+    if (
+      !(await User.exists({
+        username: process.env.BOOTSTRAP_ADMIN_USERNAME,
+      }))
+    ) {
+      await User.create({
+        username: process.env.BOOTSTRAP_ADMIN_USERNAME,
+        passwordHash: await bcrypt.hash(
+          process.env.BOOTSTRAP_ADMIN_PASSWORD,
+          12,
+        ),
+        name: "Administrator",
+        role: "admin",
+      });
+
+      console.log("Bootstrap admin account created");
+    }
+  }
+
+  app.listen(port, () => {
+    console.log(`Radioanalysis_Scanner_api listening on ${port}`);
+  });
 }
-app.listen(port, () =>
-  console.log(`Radioanalysis_Scanner_api listening on ${port}`),
-);
+
+startServer().catch((error) => {
+  console.error("Server startup failed:", error);
+  process.exit(1);
+});
