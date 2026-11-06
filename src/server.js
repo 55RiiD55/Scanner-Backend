@@ -1,4 +1,6 @@
 import "dotenv/config";
+import dns from "node:dns";
+dns.setServers(["8.8.8.8", "1.1.1.1"]);
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -21,7 +23,7 @@ for (const name of required)
   if (!process.env[name]) throw new Error(`${name} is required`);
 if (process.env.JWT_SECRET.length < 32)
   throw new Error("JWT_SECRET must contain at least 32 characters");
-const app = express();
+export const app = express();
 app.use(helmet());
 app.use(
   cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:3000" }),
@@ -1242,44 +1244,68 @@ app.use((err, req, res, next) => {
 });
 
 // Connect to MongoDB before starting the server.
-async function startServer() {
-  await mongoose.connect(process.env.MONGODB_URI);
+// Connect to MongoDB and initialize the administrator.
+let databasePromise;
 
-  console.log("MongoDB connected");
-
-  if (
-    process.env.BOOTSTRAP_ADMIN_USERNAME &&
-    process.env.BOOTSTRAP_ADMIN_PASSWORD
-  ) {
-    if (process.env.BOOTSTRAP_ADMIN_PASSWORD.length < 8) {
-      throw new Error("Bootstrap admin password is too short");
-    }
-
-    if (
-      !(await User.exists({
-        username: process.env.BOOTSTRAP_ADMIN_USERNAME,
-      }))
-    ) {
-      await User.create({
-        username: process.env.BOOTSTRAP_ADMIN_USERNAME,
-        passwordHash: await bcrypt.hash(
-          process.env.BOOTSTRAP_ADMIN_PASSWORD,
-          12,
-        ),
-        name: "Administrator",
-        role: "admin",
-      });
-
-      console.log("Bootstrap admin account created");
-    }
+export async function connectDatabase() {
+  if (mongoose.connection.readyState === 1) {
+    return;
   }
+
+  if (!databasePromise) {
+    databasePromise = (async () => {
+      await mongoose.connect(process.env.MONGODB_URI);
+
+      console.log("MongoDB connected");
+
+      if (
+        process.env.BOOTSTRAP_ADMIN_USERNAME &&
+        process.env.BOOTSTRAP_ADMIN_PASSWORD
+      ) {
+        if (process.env.BOOTSTRAP_ADMIN_PASSWORD.length < 8) {
+          throw new Error("Bootstrap admin password is too short");
+        }
+
+        if (
+          !(await User.exists({
+            username: process.env.BOOTSTRAP_ADMIN_USERNAME,
+          }))
+        ) {
+          await User.create({
+            username: process.env.BOOTSTRAP_ADMIN_USERNAME,
+            passwordHash: await bcrypt.hash(
+              process.env.BOOTSTRAP_ADMIN_PASSWORD,
+              12,
+            ),
+            name: "Administrator",
+            role: "admin",
+          });
+
+          console.log("Bootstrap admin account created");
+        }
+      }
+    })().catch((error) => {
+      databasePromise = null;
+      throw error;
+    });
+  }
+
+  await databasePromise;
+}
+
+// Traditional server startup for local development and Render.
+export async function startServer() {
+  await connectDatabase();
 
   app.listen(port, () => {
     console.log(`Radioanalysis_Scanner_api listening on ${port}`);
   });
 }
 
-startServer().catch((error) => {
-  console.error("Server startup failed:", error);
-  process.exit(1);
-});
+// Do not start a persistent listener on Vercel.
+if (process.env.VERCEL !== "1") {
+  startServer().catch((error) => {
+    console.error("Server startup failed:", error);
+    process.exit(1);
+  });
+}
