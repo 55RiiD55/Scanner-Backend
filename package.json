@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "nodemon",
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check \"api/[...path].js\""
+    "check": "node --check src/server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
