@@ -14,7 +14,9 @@ import {
   createHmac,
   timingSafeEqual,
 } from "node:crypto";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const required = ["MONGODB_URI", "JWT_SECRET"];
 for (const name of required)
@@ -214,42 +216,62 @@ const signInToken = (user) =>
     subject: String(user.id),
     expiresIn: "8h",
   });
-const otpTransport = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT),
-  secure: Number(process.env.SMTP_PORT) === 465,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
-});
+
 async function issueOtp(user, existingChallenge) {
   if (
-    !process.env.OTP_RECIPIENT_EMAIL ||
-    !process.env.SMTP_HOST ||
-    !process.env.SMTP_USER ||
-    !process.env.SMTP_PASSWORD ||
-    !process.env.SMTP_FROM
+    !process.env.RESEND_API_KEY ||
+    !process.env.RESEND_FROM ||
+    !process.env.OTP_RECIPIENT_EMAIL
   ) {
-    throw new Error("Email OTP SMTP configuration is incomplete");
+    throw new Error("Resend email configuration is incomplete");
   }
+
   const code = String(randomInt(100000, 1000000));
   const challengeToken = otpToken();
-  const now = Date.now();
-  // Do not invalidate a working code until the new email is accepted.
-  await otpTransport.sendMail({
-    from: process.env.SMTP_FROM,
-    to: process.env.OTP_RECIPIENT_EMAIL,
-    subject: `Scanner login verification - ${user.username}`,
-    text: `Scanner login requested for ${user.username}.\n\nYour verification code is: ${code}\n\nIt expires in 5 minutes. If you did not request this login, ignore this email.`,
-  });
-  await OtpChallenge.deleteMany({ userId: user._id });
-  await OtpChallenge.create({
+  const now = new Date();
+
+  const challenge = {
     userId: user._id,
     challengeHash: otpHash(challengeToken),
     otpHash: otpHash(code),
-    expiresAt: new Date(now + 5 * 60 * 1000),
-    resendAt: new Date(now + 60 * 1000),
-  });
+    expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
+    resendAt: new Date(now.getTime() + 60 * 1000),
+    attempts: 0,
+    consumed: false,
+  };
+
+  try {
+    const { error } = await resend.emails.send({
+      from: process.env.RESEND_FROM,
+      to: process.env.OTP_RECIPIENT_EMAIL,
+      subject: `Scanner login verification - ${user.username}`,
+      text: `Scanner login requested for ${user.username}.
+
+Your verification code is: ${code}
+
+It expires in 5 minutes. If you did not request this login, ignore this email.`,
+    });
+
+    if (error) {
+      console.error("Resend email failed:", error);
+      throw new Error("Unable to send OTP email");
+    }
+  } catch (error) {
+    console.error("OTP email delivery failed:", error);
+    throw new Error("Unable to send OTP email");
+  }
+
+  if (existingChallenge) {
+    await OtpChallenge.findByIdAndUpdate(existingChallenge._id, {
+      $set: challenge,
+    });
+  } else {
+    await OtpChallenge.create(challenge);
+  }
+
   return challengeToken;
 }
+
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 const publicUser = (user) => ({
@@ -469,12 +491,6 @@ async function stopIfBatteryDepleted(sim, reading) {
   return true;
 }
 
-app.get("/api/health", (_req, res) =>
-  res.json({
-    ok: true,
-    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-  }),
-);
 app.post(
   "/api/auth/login",
   wrap(async (req, res) => {
@@ -1307,11 +1323,18 @@ export async function connectDatabase() {
   await databasePromise;
 }
 
+app.get("/api/health", (_req, res) =>
+  res.json({
+    ok: true,
+    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  }),
+);
+
 // Traditional server startup for local development and Render.
 export async function startServer() {
   await connectDatabase();
 
-  app.listen(port, () => {
+  app.listen(port, "0.0.0.0", () => {
     console.log(`Radioanalysis_Scanner_api listening on ${port}`);
   });
 }
