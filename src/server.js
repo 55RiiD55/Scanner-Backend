@@ -1,6 +1,4 @@
 import "dotenv/config";
-import dns from "node:dns";
-dns.setServers(["8.8.8.8", "1.1.1.1"]);
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -29,6 +27,22 @@ app.use(
   cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:3000" }),
 );
 app.use(express.json({ limit: "250kb" }));
+
+// Ensure MongoDB is connected before processing API requests.
+app.use(async (req, res, next) => {
+  try {
+    await connectDatabase();
+    next();
+  } catch (error) {
+    console.error("MongoDB connection failed:", error);
+
+    if (!res.headersSent) {
+      return res.status(503).json({
+        message: "Database unavailable. Please try again later.",
+      });
+    }
+  }
+});
 
 const rangeSchema = z
   .object({
@@ -1309,3 +1323,4 @@ if (process.env.VERCEL !== "1") {
     process.exit(1);
   });
 }
+export default app;
