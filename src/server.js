@@ -919,6 +919,46 @@ app.delete(
     res.status(204).end();
   }),
 );
+
+app.get(
+  "/api/locations/search",
+  auth,
+  admin,
+  wrap(async (req, res) => {
+    const query = String(req.query.q ?? "").trim();
+
+    if (query.length < 3) {
+      return res.json({ locations: [] });
+    }
+
+    const apiKey = process.env.OPENWEATHER_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({
+        message: "Location search is not configured",
+      });
+    }
+
+    const url = new URL("https://api.openweathermap.org/geo/1.0/direct");
+
+    url.searchParams.set("q", query);
+    url.searchParams.set("limit", "5");
+    url.searchParams.set("appid", apiKey);
+
+    const results = await fetchExternalJson(url);
+
+    return res.json({
+      locations: (Array.isArray(results) ? results : []).map((place) => ({
+        name: place.name,
+        state: place.state ?? "",
+        country: place.country ?? "",
+        lat: place.lat,
+        lon: place.lon,
+      })),
+    });
+  }),
+);
+
 app.get(
   "/api/admin/scenarios",
   auth,
