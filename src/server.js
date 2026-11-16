@@ -295,10 +295,64 @@ const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 async function fetchExternalJson(url) {
+  const requestUrl = new URL(String(url));
+  const cooldownKey = `${requestUrl.hostname}${requestUrl.pathname}`;
+
+  const cooldownUntil = externalApiCooldowns.get(cooldownKey);
+
+  if (cooldownUntil && cooldownUntil > Date.now()) {
+    const error = new Error(
+      `External API cooldown active for ${Math.ceil(
+        (cooldownUntil - Date.now()) / 1000,
+      )} seconds`,
+    );
+
+    error.status = 429;
+    error.retryAfterMs = cooldownUntil - Date.now();
+
+    throw error;
+  }
+
   try {
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(15000),
+    const response = await fetch(requestUrl, {
+      signal: AbortSignal.timeout(EXTERNAL_API_TIMEOUT),
+      headers: {
+        Accept: "application/json",
+      },
     });
+
+    if (response.status === 429) {
+      const retryAfter = response.headers.get("retry-after");
+
+      let retryAfterMs = 5 * 60 * 1000;
+
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+
+        if (Number.isFinite(seconds)) {
+          retryAfterMs = Math.max(1000, seconds * 1000);
+        } else {
+          const retryDate = Date.parse(retryAfter);
+
+          if (Number.isFinite(retryDate)) {
+            retryAfterMs = Math.max(1000, retryDate - Date.now());
+          }
+        }
+      }
+
+      externalApiCooldowns.set(cooldownKey, Date.now() + retryAfterMs);
+
+      const error = new Error(
+        `External API returned 429: Too Many Requests. Retry after ${Math.ceil(
+          retryAfterMs / 1000,
+        )} seconds.`,
+      );
+
+      error.status = 429;
+      error.retryAfterMs = retryAfterMs;
+
+      throw error;
+    }
 
     if (!response.ok) {
       throw new Error(
@@ -306,11 +360,17 @@ async function fetchExternalJson(url) {
       );
     }
 
-    return await response.json();
+    const data = await response.json();
+
+    externalApiCooldowns.delete(cooldownKey);
+
+    return data;
   } catch (error) {
     console.error("[External API Request Failed]", {
-      url: String(url),
+      url: String(requestUrl),
       message: error instanceof Error ? error.message : String(error),
+      status: error?.status,
+      retryAfterMs: error?.retryAfterMs,
       cause: error?.cause,
     });
 
@@ -404,6 +464,14 @@ const stableFrom = (scenario) => ({
 });
 
 const weatherCache = new Map();
+const geocodingCache = new Map();
+const weatherRequestsInFlight = new Map();
+const externalApiCooldowns = new Map();
+
+const WEATHER_CACHE_TTL = 5 * 60 * 1000;
+const GEOCODING_CACHE_TTL = 24 * 60 * 60 * 1000;
+const WEATHER_STALE_MAX_AGE = 24 * 60 * 60 * 1000;
+const EXTERNAL_API_TIMEOUT = 15000;
 
 function environmentFromWeather(result) {
   return {
@@ -416,6 +484,155 @@ function environmentFromWeather(result) {
     observedAt: result.observedAt ?? null,
     timezone: result.timezone ?? null,
   };
+}
+
+async function fetchWeatherForLocation(location) {
+  const now = Date.now();
+
+  // Return fresh weather immediately.
+  const cachedWeather = weatherCache.get(location);
+
+  if (cachedWeather && cachedWeather.expiresAt > now) {
+    console.log("[Weather] Using fresh cached weather");
+
+    return {
+      ...cachedWeather.data,
+      isStale: false,
+    };
+  }
+
+  // Share an existing request for this location.
+  const existingRequest = weatherRequestsInFlight.get(location);
+
+  if (existingRequest) {
+    console.log("[Weather] Reusing in-flight request");
+    return existingRequest;
+  }
+
+  const requestPromise = (async () => {
+    try {
+      let place;
+
+      // Reuse cached geocoding coordinates.
+      const cachedGeo = geocodingCache.get(location);
+
+      if (cachedGeo && cachedGeo.expiresAt > Date.now()) {
+        console.log("[Weather] Using cached geocoding");
+        place = cachedGeo.data;
+      } else {
+        const geoUrl = new URL(
+          "https://geocoding-api.open-meteo.com/v1/search",
+        );
+
+        geoUrl.searchParams.set("name", location);
+        geoUrl.searchParams.set("count", "1");
+
+        console.log("[Weather] Requesting geocoding");
+
+        const geoData = await fetchExternalJson(geoUrl);
+
+        place = geoData.results?.[0];
+
+        if (!place) {
+          throw new Error("Configured location not found");
+        }
+
+        geocodingCache.set(location, {
+          data: place,
+          expiresAt: Date.now() + GEOCODING_CACHE_TTL,
+        });
+      }
+
+      const weatherUrl = new URL("https://api.open-meteo.com/v1/forecast");
+
+      weatherUrl.searchParams.set("latitude", String(place.latitude));
+
+      weatherUrl.searchParams.set("longitude", String(place.longitude));
+
+      weatherUrl.searchParams.set(
+        "current",
+        [
+          "temperature_2m",
+          "surface_pressure",
+          "relative_humidity_2m",
+          "wind_speed_10m",
+          "weather_code",
+        ].join(","),
+      );
+
+      weatherUrl.searchParams.set("timezone", "auto");
+
+      console.log("[Weather] Requesting current weather");
+
+      const weather = await fetchExternalJson(weatherUrl);
+
+      if (!weather.current) {
+        throw new Error("Current weather unavailable");
+      }
+
+      const result = {
+        success: true,
+        source: "Open-Meteo",
+        location,
+        resolvedLocation: [place.name, place.admin1, place.country]
+          .filter(Boolean)
+          .join(", "),
+        temperature: weather.current.temperature_2m,
+        pressure: weather.current.surface_pressure,
+        humidity: weather.current.relative_humidity_2m,
+        windSpeed: weather.current.wind_speed_10m,
+        weatherCode: weather.current.weather_code,
+        observedAt: weather.current.time,
+        timezone: weather.timezone,
+      };
+
+      weatherCache.set(location, {
+        data: result,
+        expiresAt: Date.now() + WEATHER_CACHE_TTL,
+        staleUntil: Date.now() + WEATHER_STALE_MAX_AGE,
+      });
+
+      console.log("[Weather] Fresh weather cached");
+
+      return {
+        ...result,
+        isStale: false,
+      };
+    } catch (error) {
+      console.error("[Weather] Refresh failed:", {
+        location,
+        message: error instanceof Error ? error.message : String(error),
+        status: error?.status,
+      });
+
+      // Use the last successful weather reading if it is
+      // not older than the allowed stale-data period.
+      const previousWeather = weatherCache.get(location);
+
+      if (previousWeather && previousWeather.staleUntil > Date.now()) {
+        console.warn("[Weather] Returning stale weather fallback");
+
+        return {
+          ...previousWeather.data,
+          isStale: true,
+          staleReason:
+            error instanceof Error
+              ? error.message
+              : "Weather provider unavailable",
+        };
+      }
+
+      throw error;
+    }
+  })();
+
+  weatherRequestsInFlight.set(location, requestPromise);
+
+  try {
+    return await requestPromise;
+  } finally {
+    weatherRequestsInFlight.delete(location);
+  }
 }
 
 async function saveEnvironmentSnapshot(userId, result) {
@@ -1171,12 +1388,6 @@ app.get(
   "/api/weather/current",
   auth,
   wrap(async (req, res) => {
-    console.log("[Weather] Request started", {
-      userId: req.user.id,
-    });
-
-    console.log("[Weather] Looking up assigned scenario");
-
     const scenario = await Scenario.findOne({
       userId: req.user.id,
       enabled: true,
@@ -1190,99 +1401,50 @@ app.get(
 
     const location = String(scenario.location ?? "").trim();
 
-    console.log("[Weather] Scenario found", { location });
-
     if (!location || location === "[object Object]") {
       return res.status(400).json({
         message: "A valid location is required",
       });
     }
 
-    const cached = weatherCache.get(location);
+    let result;
 
-    if (cached && cached.expiresAt > Date.now()) {
-      console.log("[Weather] Using cached weather");
+    try {
+      result = await fetchWeatherForLocation(location);
+    } catch (error) {
+      console.error("[Weather] No usable weather data:", {
+        location,
+        message: error instanceof Error ? error.message : String(error),
+        status: error?.status,
+        cause: error?.cause,
+      });
 
-      console.log("[Weather] Saving cached snapshot");
-      await saveEnvironmentSnapshot(req.user.id, cached.data);
+      const retryAfterSeconds = error?.retryAfterMs
+        ? Math.ceil(error.retryAfterMs / 1000)
+        : 60;
 
-      console.log("[Weather] Cached snapshot saved");
-      return res.json(cached.data);
-    }
+      res.set("Retry-After", String(retryAfterSeconds));
 
-    const geoUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
-
-    geoUrl.searchParams.set("name", location);
-    geoUrl.searchParams.set("count", "1");
-
-    console.log("[Weather] Requesting geocoding");
-
-    const geoData = await fetchExternalJson(geoUrl);
-
-    console.log("[Weather] Geocoding response received");
-
-    const place = geoData.results?.[0];
-
-    if (!place) {
-      return res.status(404).json({
-        message: "Configured location not found",
+      return res.status(503).json({
+        success: false,
+        message: "Weather service is temporarily unavailable",
+        retryAfter: retryAfterSeconds,
       });
     }
 
-    const weatherUrl = new URL("https://api.open-meteo.com/v1/forecast");
-
-    weatherUrl.searchParams.set("latitude", String(place.latitude));
-    weatherUrl.searchParams.set("longitude", String(place.longitude));
-
-    weatherUrl.searchParams.set(
-      "current",
-      [
-        "temperature_2m",
-        "surface_pressure",
-        "relative_humidity_2m",
-        "wind_speed_10m",
-        "weather_code",
-      ].join(","),
-    );
-
-    weatherUrl.searchParams.set("timezone", "auto");
-
-    console.log("[Weather] Requesting current weather");
-
-    const weather = await fetchExternalJson(weatherUrl);
-
-    console.log("[Weather] Weather response received");
-
-    if (!weather.current) {
-      throw new Error("Current weather unavailable");
-    }
-
-    const result = {
-      success: true,
-      source: "Open-Meteo",
+    console.log("[Weather] Saving environment snapshot", {
+      userId: String(req.user.id),
       location,
-      resolvedLocation: [place.name, place.admin1, place.country]
-        .filter(Boolean)
-        .join(", "),
-      temperature: weather.current.temperature_2m,
-      pressure: weather.current.surface_pressure,
-      humidity: weather.current.relative_humidity_2m,
-      windSpeed: weather.current.wind_speed_10m,
-      weatherCode: weather.current.weather_code,
-      observedAt: weather.current.time,
-      timezone: weather.timezone,
-    };
-
-    weatherCache.set(location, {
-      data: result,
-      expiresAt: Date.now() + 5 * 60 * 1000,
+      isStale: result.isStale === true,
     });
-
-    console.log("[Weather] Saving environment snapshot");
 
     await saveEnvironmentSnapshot(req.user.id, result);
 
-    console.log("[Weather] Environment snapshot saved");
+    console.log("[Weather] Environment snapshot saved", {
+      location,
+      isStale: result.isStale === true,
+      observedAt: result.observedAt,
+    });
 
     return res.json(result);
   }),
