@@ -18,8 +18,6 @@ import { Resend } from "resend";
 
 import { renderImpressionSummary } from "./Server_utils/impressionPdfRenderer.js";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-
 const required = ["MONGODB_URI", "JWT_SECRET"];
 for (const name of required)
   if (!process.env[name]) throw new Error(`${name} is required`);
@@ -34,6 +32,10 @@ app.use(express.json({ limit: "250kb" }));
 
 // Ensure MongoDB is connected before processing API requests.
 app.use(async (req, res, next) => {
+  if (req.path === "/api/health") {
+    return next();
+  }
+
   try {
     await connectDatabase();
     next();
@@ -242,6 +244,7 @@ async function issueOtp(user, existingChallenge) {
     throw new Error("Resend email configuration is incomplete");
   }
 
+  const resend = new Resend(process.env.RESEND_API_KEY);
   const code = String(randomInt(100000, 1000000));
   const challengeToken = otpToken();
   const now = new Date();
@@ -290,6 +293,31 @@ It expires in 5 minutes. If you did not request this login, ignore this email.`,
 
 const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
+
+async function fetchExternalJson(url) {
+  try {
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `External API returned ${response.status}: ${response.statusText}`,
+      );
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("[External API Request Failed]", {
+      url: String(url),
+      message: error instanceof Error ? error.message : String(error),
+      cause: error?.cause,
+    });
+
+    throw error;
+  }
+}
+
 const publicUser = (user) => ({
   id: String(user.id),
   username: user.username,
@@ -302,16 +330,19 @@ const publicUser = (user) => ({
 const auth = wrap(async (req, res, next) => {
   const token = /^Bearer (.+)$/.exec(req.headers.authorization || "")?.[1];
   if (!token) return res.status(401).json({ message: "Missing bearer token" });
+
+  let payload;
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(payload.sub);
-    if (!user || !user.active)
-      return res.status(401).json({ message: "Account unavailable" });
-    req.user = user;
-    next();
+    payload = jwt.verify(token, process.env.JWT_SECRET);
   } catch {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
+
+  const user = await User.findById(payload.sub);
+  if (!user || !user.active)
+    return res.status(401).json({ message: "Account unavailable" });
+  req.user = user;
+  next();
 });
 const admin = (req, res, next) =>
   req.user.role === "admin"
@@ -1173,15 +1204,7 @@ app.get(
     geoUrl.searchParams.set("name", location);
     geoUrl.searchParams.set("count", "1");
 
-    const geoResponse = await fetch(geoUrl, {
-      signal: AbortSignal.timeout(8000),
-    });
-
-    if (!geoResponse.ok) {
-      throw new Error("Geocoding service unavailable");
-    }
-
-    const geoData = await geoResponse.json();
+    const geoData = await fetchExternalJson(geoUrl);
     const place = geoData.results?.[0];
 
     if (!place) {
@@ -1209,15 +1232,7 @@ app.get(
 
     weatherUrl.searchParams.set("timezone", "auto");
 
-    const weatherResponse = await fetch(weatherUrl, {
-      signal: AbortSignal.timeout(8000),
-    });
-
-    if (!weatherResponse.ok) {
-      throw new Error("Weather service unavailable");
-    }
-
-    const weather = await weatherResponse.json();
+    const weather = await fetchExternalJson(weatherUrl);
 
     if (!weather.current) {
       throw new Error("Current weather unavailable");
