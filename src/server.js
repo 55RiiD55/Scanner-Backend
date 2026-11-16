@@ -1412,24 +1412,64 @@ app.get(
     try {
       result = await fetchWeatherForLocation(location);
     } catch (error) {
-      console.error("[Weather] No usable weather data:", {
+      console.error("[Weather] No usable fresh weather data:", {
         location,
         message: error instanceof Error ? error.message : String(error),
         status: error?.status,
-        cause: error?.cause,
+        retryAfterMs: error?.retryAfterMs,
       });
 
-      const retryAfterSeconds = error?.retryAfterMs
-        ? Math.ceil(error.retryAfterMs / 1000)
-        : 60;
+      // Fall back to the latest persisted weather snapshot.
+      // This also works after a Render restart clears memory caches.
+      const previousSimulation = await Simulation.findOne({
+        userId: req.user.id,
+        status: "running",
+        environmentSnapshot: { $ne: null },
+      }).sort({ startedAt: -1 });
 
-      res.set("Retry-After", String(retryAfterSeconds));
+      const previousSnapshot = previousSimulation?.environmentSnapshot;
 
-      return res.status(503).json({
-        success: false,
-        message: "Weather service is temporarily unavailable",
-        retryAfter: retryAfterSeconds,
-      });
+      if (
+        previousSnapshot &&
+        Number.isFinite(previousSnapshot.temperature) &&
+        Number.isFinite(previousSnapshot.pressure) &&
+        Number.isFinite(previousSnapshot.humidity) &&
+        Number.isFinite(previousSnapshot.windSpeed)
+      ) {
+        console.warn("[Weather] Returning MongoDB snapshot fallback", {
+          simulationId: String(previousSimulation._id),
+          observedAt: previousSnapshot.observedAt,
+        });
+
+        result = {
+          success: true,
+          source: previousSnapshot.source ?? "Open-Meteo",
+          location: previousSnapshot.location ?? location,
+          temperature: previousSnapshot.temperature,
+          pressure: previousSnapshot.pressure,
+          humidity: previousSnapshot.humidity,
+          windSpeed: previousSnapshot.windSpeed,
+          observedAt: previousSnapshot.observedAt,
+          timezone: previousSnapshot.timezone,
+          isStale: true,
+          staleReason:
+            error instanceof Error
+              ? error.message
+              : "Weather provider unavailable",
+        };
+      } else {
+        const retryAfterSeconds = error?.retryAfterMs
+          ? Math.ceil(error.retryAfterMs / 1000)
+          : 60;
+
+        res.set("Retry-After", String(retryAfterSeconds));
+
+        return res.status(503).json({
+          success: false,
+          message: "Weather service is temporarily unavailable",
+          retryAfter: retryAfterSeconds,
+        });
+      }
     }
 
     console.log("[Weather] Saving environment snapshot", {
