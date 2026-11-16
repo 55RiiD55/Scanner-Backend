@@ -1171,6 +1171,12 @@ app.get(
   "/api/weather/current",
   auth,
   wrap(async (req, res) => {
+    console.log("[Weather] Request started", {
+      userId: req.user.id,
+    });
+
+    console.log("[Weather] Looking up assigned scenario");
+
     const scenario = await Scenario.findOne({
       userId: req.user.id,
       enabled: true,
@@ -1184,27 +1190,37 @@ app.get(
 
     const location = String(scenario.location ?? "").trim();
 
+    console.log("[Weather] Scenario found", { location });
+
     if (!location || location === "[object Object]") {
       return res.status(400).json({
         message: "A valid location is required",
       });
     }
 
-    // Check cached weather first.
     const cached = weatherCache.get(location);
 
     if (cached && cached.expiresAt > Date.now()) {
+      console.log("[Weather] Using cached weather");
+
+      console.log("[Weather] Saving cached snapshot");
       await saveEnvironmentSnapshot(req.user.id, cached.data);
+
+      console.log("[Weather] Cached snapshot saved");
       return res.json(cached.data);
     }
 
-    // Resolve configured location.
     const geoUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
 
     geoUrl.searchParams.set("name", location);
     geoUrl.searchParams.set("count", "1");
 
+    console.log("[Weather] Requesting geocoding");
+
     const geoData = await fetchExternalJson(geoUrl);
+
+    console.log("[Weather] Geocoding response received");
+
     const place = geoData.results?.[0];
 
     if (!place) {
@@ -1213,7 +1229,6 @@ app.get(
       });
     }
 
-    // Fetch current weather.
     const weatherUrl = new URL("https://api.open-meteo.com/v1/forecast");
 
     weatherUrl.searchParams.set("latitude", String(place.latitude));
@@ -1232,7 +1247,11 @@ app.get(
 
     weatherUrl.searchParams.set("timezone", "auto");
 
+    console.log("[Weather] Requesting current weather");
+
     const weather = await fetchExternalJson(weatherUrl);
+
+    console.log("[Weather] Weather response received");
 
     if (!weather.current) {
       throw new Error("Current weather unavailable");
@@ -1254,14 +1273,16 @@ app.get(
       timezone: weather.timezone,
     };
 
-    // Cache weather for five minutes.
     weatherCache.set(location, {
       data: result,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
 
-    // Save weather against the latest running simulation.
+    console.log("[Weather] Saving environment snapshot");
+
     await saveEnvironmentSnapshot(req.user.id, result);
+
+    console.log("[Weather] Environment snapshot saved");
 
     return res.json(result);
   }),
