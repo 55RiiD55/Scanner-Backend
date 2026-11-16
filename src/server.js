@@ -16,6 +16,8 @@ import {
 } from "node:crypto";
 import { Resend } from "resend";
 
+import { renderImpressionSummary } from "./Server_utils/impressionPdfRenderer.js";
+
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const required = ["MONGODB_URI", "JWT_SECRET"];
@@ -148,6 +150,20 @@ const Scenario = mongoose.model(
   ),
 );
 
+const EnvironmentSnapshotSchema = new mongoose.Schema(
+  {
+    temperature: Number,
+    pressure: Number,
+    humidity: Number,
+    windSpeed: Number,
+    source: String,
+    location: String,
+    observedAt: String,
+    timezone: String,
+  },
+  { _id: false },
+);
+
 const SimulationSchema = new mongoose.Schema(
   {
     userId: {
@@ -166,7 +182,7 @@ const SimulationSchema = new mongoose.Schema(
     scenarioSnapshot: Object,
     stableResults: Object,
     environmentSnapshot: {
-      type: Object,
+      type: EnvironmentSnapshotSchema,
       default: null,
     },
     seed: Number,
@@ -360,14 +376,14 @@ const weatherCache = new Map();
 
 function environmentFromWeather(result) {
   return {
-    temperature: result.temperature,
-    pressure: result.pressure,
-    humidity: result.humidity,
-    windSpeed: result.windSpeed,
-    source: result.source,
-    location: result.location,
-    observedAt: result.observedAt,
-    timezone: result.timezone,
+    temperature: Number(result.temperature),
+    pressure: Number(result.pressure),
+    humidity: Number(result.humidity),
+    windSpeed: Number(result.windSpeed),
+    source: result.source ?? "Open-Meteo",
+    location: result.location ?? "",
+    observedAt: result.observedAt ?? null,
+    timezone: result.timezone ?? null,
   };
 }
 
@@ -830,6 +846,7 @@ app.get(
       videoEnabled: scenario?.videoEnabled ?? false,
       scanDurationSeconds: scenario?.scanDurationSeconds ?? 10,
       values,
+      environmentSnapshot: sim.environmentSnapshot ?? null,
     });
   }),
 );
@@ -915,6 +932,7 @@ app.get(
  * Lists simulations, newest first.
  * Optional query: userId
  */
+
 app.get(
   "/api/admin/reports",
   auth,
@@ -930,6 +948,7 @@ app.get(
           message: "Invalid user ID",
         });
       }
+
       filter.userId = userId;
     }
 
@@ -947,12 +966,18 @@ app.get(
         status: sim.status,
         startedAt: sim.startedAt,
         stoppedAt: sim.stoppedAt ?? null,
+
         scenarioType: snapshot.scenarioType,
         scenarioName: snapshot.scenarioName,
         location: snapshot.location,
+
         isotopes: snapshot.isotopes || [],
         impression: normalizeImpressions(snapshot.impression),
+
         stableResults: sim.stableResults || {},
+
+        // Persisted environmental readings
+        environmentSnapshot: sim.environmentSnapshot ?? null,
       };
     });
 
@@ -1105,27 +1130,7 @@ app.get(
         ? [scenario.impression]
         : [];
 
-    if (impressions.length === 0) {
-      doc.font("Helvetica").fontSize(11).text("No impression available.");
-    } else {
-      impressions.forEach((item, index) => {
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(11)
-          .fillColor("#0f172a")
-          .text(`${index + 1}. ${item.title || "Untitled"}`);
-
-        doc.moveDown(0.3);
-
-        doc
-          .font("Helvetica")
-          .fontSize(10)
-          .fillColor("#334155")
-          .text(item.description || "");
-
-        doc.moveDown(0.7);
-      });
-    }
+    renderImpressionSummary(doc, impressions);
 
     doc.end();
   }),
